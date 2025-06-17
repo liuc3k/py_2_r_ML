@@ -1,0 +1,142 @@
+library(reticulate)
+library(rsample)
+
+# install_miniconda()
+
+conda_create("r-nanimputer-env", packages = "python=3.10")
+# conda_list()
+# reticulate::conda_install("r-nanimputer-env", 
+#                           packages = c("verstack", "pandas", "scikit-learn","lazypredict","optuna","lime"),
+#                           pip = TRUE
+# )
+# use_condaenv("r-nanimputer-env", required = TRUE)
+# py_config()
+# virtualenv_create()
+# py_install(c("lazypredict"), method = "pip")
+# py_install("lime",method="pip")
+# py_install(c("verstack", "pandas", "scikit-learn","lazypredict","optuna","lime"), method = "pip")
+# py_require("optuna")
+# py_require("lime")
+# py_run_string("import pkg_resources; print([(d.project_name, d.version) for d in pkg_resources.working_set])")
+py_require(c("verstack", "pandas", "scikit-learn","lazypredict","optuna","lime","numpy"))
+##Import required packages:
+lazy <- import("lazypredict.Supervised")
+verstack <- import("verstack")
+NaNImputer <- verstack$NaNImputer
+pd <- import("pandas")
+np <- import("numpy")
+xgb <- import("xgboost")
+# sklearn <- import("sklearn.model_selection")
+sklearn_model_selection <- import("sklearn.model_selection")
+optuna <- import("optuna")
+# Create sample data
+
+df<-read.csv('C:/Users/aas41/OneDrive/桌面/nanimputer_toy_data.csv')
+df[df=='']<-NA
+# Step 2: Convert R dataframe to pandas dataframe
+df_py <- r_to_py(df)
+# Step 3: Run NaNImputer
+imputer <- NaNImputer()
+df_imputed_py <- imputer$impute(df_py)
+
+# Step 4: Convert back to R
+df_imputed <- py_to_r(df_imputed_py)
+
+
+##Lazy Predict
+# Your existing R dataset
+# Example: df (data.frame), with outcome variable `y`(0/1)
+
+
+
+set.seed(123)
+split<-initial_split(df_imputed,prop = 0.8,strata = outcome)
+train_data<-training(split)
+test_data<-testing(split)
+X_train<-train_data[,-ncol(train_data)]
+y_train<-train_data$outcome
+
+X_test<-test_data[,-ncol(test_data)]
+y_test<-test_data$outcome
+
+# Convert to Python
+X_train_py <- r_to_py(as.data.frame(X_train))
+y_train_py <- r_to_py(as.integer(as.factor(y_train)))  # ensure numeric labels
+X_test_py <- r_to_py(as.data.frame(X_test))
+y_test_py <- r_to_py(as.integer(as.factor(y_test)))  # ensure numeric labels
+
+
+# Run LazyClassifier
+clf <- lazy$LazyClassifier(verbose = FALSE, ignore_warnings = TRUE)
+results <- clf$fit(X_train, X_test, y_train, y_test)
+
+# Convert results to R. Should consider Balanced Accuracy((Recall+Specificity)/2)
+model_results <- py_to_r(results[[1]])
+print(model_results)
+
+##Tune the hyperparameter via Optuna
+
+
+#step 1 
+# Assuming df is your R dataset with outcome 
+df_imputed_ <- df_imputed %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  mutate(across(where(is.factor), ~ as.integer(.)))
+X <- df_imputed_[, setdiff(names(df_imputed_), "outcome")]
+y <- df_imputed_$outcome
+
+# Convert to Python
+X_py <- r_to_py(as.matrix(X))
+y_py <- r_to_py(as.integer(y))  # classification
+
+
+# Define the objective function for Optuna
+objective <- function(trial) {
+  params <- dict(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = trial$suggest_float("eta", 0.01, 0.3),
+    max_depth = trial$suggest_int("max_depth", 3L, 10L),
+    subsample = trial$suggest_float("subsample", 0.5, 1.0),
+    colsample_bytree = trial$suggest_float("colsample_bytree", 0.5, 1.0)
+  )
+  
+  split <- sklearn_model_selection$train_test_split(X_py, y_py, test_size = 0.2, random_state = 42L)
+  X_train <- split[[1]]
+  X_valid <- split[[2]]
+  y_train <- split[[3]]
+  y_valid <- split[[4]]
+  
+  dtrain <- xgb$DMatrix(X_train, label = y_train)
+  dvalid <- xgb$DMatrix(X_valid, label = y_valid)
+  
+  model <- xgb$train(
+    params = params,
+    dtrain = dtrain,
+    num_boost_round = 200L,
+    evals = list(list(dvalid, "eval")),
+    early_stopping_rounds = 10L,
+    verbose_eval = 0L
+  )
+  
+  score <- model$best_score
+  return(score)
+}
+
+study <- optuna$create_study(direction = "minimize")  # logloss minimization
+study$optimize(objective, n_trials = 50L)
+
+# Get best parameters
+best_params <- study$best_params
+print(best_params)
+
+
+##SS
+
+##MS
+
+##VT
+
+###SP-LIME (pART I)
+
+##LIME (Part II)
