@@ -142,62 +142,120 @@ print(best_params)
 ##SS
 
 ##MS
-#Define Control Parameters
+
+library(lime)
+library(dplyr)
+library(caret)
+library(xgboost)
+data(iris)
+iris <- iris[iris$Species != "setosa", ]
+iris$Species <- factor(iris$Species)
+xgb_grid <- data.frame(
+  nrounds = 100,
+  max_depth = 3,
+  eta = 0.1,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
 seeds <- 1:5
 folds <- 10
-lime_results <- list()
-#Main Loop for Multi-Split + LIME
+results <- list()
+model_index <- 1
+
 for (seed in seeds) {
   set.seed(seed)
-  cv_folds <- createFolds(iris$Species, k = folds, returnTrain = TRUE)
   
-  for (fold in seq_along(cv_folds)) {
-    train_data <- iris[cv_folds[[fold]], ]
-    test_data  <- iris[-cv_folds[[fold]], ]
-    if (nrow(test_data) == 0) next
+  fold_indices <- createFolds(iris$Species, k = folds, returnTrain = TRUE)
+  
+  for (fold in seq_along(fold_indices)) {
+    train_data <- iris[fold_indices[[fold]], ]
+    test_data  <- iris[-fold_indices[[fold]], ]
     
-    model <- tryCatch({
-      train(Species ~ ., data = train_data, method = "xgbTree", trControl = trainControl("none"))
-    }, error = function(e) NULL)
-    if (is.null(model)) next
+    # Train XGBoost model on this fold
+    model <- 
+      train(
+        Species ~ .,
+        data = train_data,
+        method = "xgbTree",
+        trControl = trainControl(method = "none"),
+        tuneGrid = xgb_grid
+      )
     
-    explainer <- lime(train_data[, -5], model, bin_continuous = TRUE, n_bins = 4)
-    reps <- test_data[sample(nrow(test_data), min(5, nrow(test_data))), -5]
-    if (nrow(reps) == 0) next
     
-    explanation <- tryCatch({
-      explain(reps, explainer, n_labels = 1, n_features = 10, labels = "versicolor")  # replace with your positive class
-    }, error = function(e) NULL)
+    # Store model and data
+    results[[model_index]] <- list(
+      model = model,
+      train = train_data,
+      test = test_data,
+      seed = seed,
+      fold = fold
+    )
     
-    if (!is.null(explanation) && nrow(explanation) > 0) {
-      explanation$seed <- seed
-      explanation$fold <- fold
-      lime_results[[length(lime_results) + 1]] <- explanation
-    }
+    model_index <- model_index + 1
   }
 }
-valid_results <- Filter(function(x) !is.null(x) && is.data.frame(x) && nrow(x) > 0, lime_results)
 
-all_explanations <- bind_rows(valid_results)
 
-# Step 1: Aggregate by feature with mean weight and abs
+length(results)  # Should be 50
+
+
+lime_results <- list()
+
+for (i in seq_along(results)) {
+  res <- results[[i]]
+  model <- res$model
+  train_data <- res$train
+  test_data <- res$test
+  
+  
+  
+  # Create LIME explainer
+  explainer <- 
+    lime(train_data[, -which(names(train_data) == "Species")], 
+         model)
+  
+  
+  
+  
+  # Sample representative test points
+  reps <- test_data[sample(nrow(test_data), min(5, nrow(test_data))), 
+                    -which(names(test_data) == "Species")]
+  
+  # Explain for positive class (e.g., "versicolor")
+  explanation <-
+    lime::explain(reps, explainer, n_features = 10, labels = "versicolor")
+  
+  
+  if (!is.null(explanation) && nrow(explanation) > 0) {
+    explanation$fold <- res$fold
+    explanation$seed <- res$seed
+    lime_results[[length(lime_results) + 1]] <- explanation
+  }
+}
+
+
+all_explanations <- bind_rows(
+  Filter(function(x) !is.null(x) && is.data.frame(x) && nrow(x) > 0, lime_results)
+)
+
+# Summarize by feature
 feature_summary <- all_explanations %>%
   group_by(feature) %>%
   summarise(mean_weight = mean(feature_weight), .groups = "drop") %>%
   mutate(
-    abs_weight = abs(mean_weight)
-  )
-
-# Step 2: Compute total contribution using abs weights
-total_abs_weight <- sum(feature_summary$abs_weight)
-
-feature_summary <- feature_summary %>%
-  mutate(contribution_pct = abs_weight / total_abs_weight) %>%
+    abs_weight = abs(mean_weight),
+    contribution_pct = abs_weight / sum(abs_weight)
+  ) %>%
   filter(contribution_pct >= 0.03)
 
-# Step 3: Filter to explanation rows with selected features
+# Filter explanation to those features only
 filtered_explanations <- all_explanations %>%
   filter(feature %in% feature_summary$feature)
+
+# Final aggregation by feature_desc (for plot)
 global_sp_lime <- filtered_explanations %>%
   group_by(feature_desc) %>%
   summarise(mean_weight = mean(feature_weight), .groups = "drop") %>%
@@ -206,17 +264,21 @@ global_sp_lime <- filtered_explanations %>%
     direction = ifelse(mean_weight >= 0, "positive", "negative")
   ) %>%
   arrange(desc(abs_weight))
+
+library(ggplot2)
+
 ggplot(global_sp_lime, aes(x = reorder(feature_desc, mean_weight), y = mean_weight, fill = direction)) +
   geom_col() +
   coord_flip() +
   scale_fill_manual(values = c("positive" = "orange", "negative" = "blue")) +
   labs(
-    title = "SP-LIME Global Explanation (Class = 'Yes') — Multi-Split",
-    x = "Feature (Binned Description)",
-    y = "Mean Contribution toward 'Yes'"
+    title = "SP-LIME Global Explanation (Class = 'versicolor')",
+    x = "Feature (Binned)",
+    y = "Mean LIME Contribution"
   ) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
   theme_minimal()
+
 
 ##VT
 
