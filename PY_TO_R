@@ -176,7 +176,8 @@ for (seed in seeds) {
     }
   }
 }
-valid_results <- lime_results[sapply(lime_results, function(x) !is.null(x) && nrow(x) > 0)]
+valid_results <- Filter(function(x) !is.null(x) && is.data.frame(x) && nrow(x) > 0, lime_results)
+
 all_explanations <- bind_rows(valid_results)
 
 # Step 1: Aggregate by feature with mean weight and abs
