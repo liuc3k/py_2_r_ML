@@ -176,6 +176,46 @@ for (seed in seeds) {
     }
   }
 }
+valid_results <- lime_results[sapply(lime_results, function(x) !is.null(x) && nrow(x) > 0)]
+all_explanations <- bind_rows(valid_results)
+
+# Step 1: Aggregate by feature with mean weight and abs
+feature_summary <- all_explanations %>%
+  group_by(feature) %>%
+  summarise(mean_weight = mean(feature_weight), .groups = "drop") %>%
+  mutate(
+    abs_weight = abs(mean_weight)
+  )
+
+# Step 2: Compute total contribution using abs weights
+total_abs_weight <- sum(feature_summary$abs_weight)
+
+feature_summary <- feature_summary %>%
+  mutate(contribution_pct = abs_weight / total_abs_weight) %>%
+  filter(contribution_pct >= 0.03)
+
+# Step 3: Filter to explanation rows with selected features
+filtered_explanations <- all_explanations %>%
+  filter(feature %in% feature_summary$feature)
+global_sp_lime <- filtered_explanations %>%
+  group_by(feature_desc) %>%
+  summarise(mean_weight = mean(feature_weight), .groups = "drop") %>%
+  mutate(
+    abs_weight = abs(mean_weight),
+    direction = ifelse(mean_weight >= 0, "positive", "negative")
+  ) %>%
+  arrange(desc(abs_weight))
+ggplot(global_sp_lime, aes(x = reorder(feature_desc, mean_weight), y = mean_weight, fill = direction)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("positive" = "orange", "negative" = "blue")) +
+  labs(
+    title = "SP-LIME Global Explanation (Class = 'Yes') — Multi-Split",
+    x = "Feature (Binned Description)",
+    y = "Mean Contribution toward 'Yes'"
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  theme_minimal()
 
 ##VT
 
