@@ -90,26 +90,37 @@ X_py <- r_to_py(as.matrix(X))
 y_py <- r_to_py(as.integer(y))  # classification
 
 
-# Define the objective function for Optuna
 objective <- function(trial) {
-  params <- dict(
-    objective = "binary:logistic",
-    eval_metric = "logloss",
-    eta = trial$suggest_float("eta", 0.01, 0.3),
-    max_depth = trial$suggest_int("max_depth", 3L, 10L),
-    subsample = trial$suggest_float("subsample", 0.5, 1.0),
-    colsample_bytree = trial$suggest_float("colsample_bytree", 0.5, 1.0)
-  )
-  
-  split <- sklearn_model_selection$train_test_split(X_py, y_py, test_size = 0.2, random_state = 42L)
+  # Train-test split
+  split <- sklearn_model_selection$train_test_split(X_py, y_py, test_size = 0.2, random_state = 2025L)
   X_train <- split[[1]]
   X_valid <- split[[2]]
   y_train <- split[[3]]
   y_valid <- split[[4]]
-  
-  dtrain <- xgb$DMatrix(X_train, label = y_train)
-  dvalid <- xgb$DMatrix(X_valid, label = y_valid)
-  
+
+  # Compute sample weights
+  train_weight <- compute_class_weights(y_train)
+  valid_weight <- compute_class_weights(y_valid)
+
+  # Create DMatrix
+  dtrain <- xgb$DMatrix(X_train, label = y_train, weight = train_weight)
+  dvalid <- xgb$DMatrix(X_valid, label = y_valid, weight = valid_weight)
+
+  # Suggest hyperparameters
+  params <- dict(
+    objective = "binary:logistic",
+    eval_metric = "logloss",  # required by XGBoost, but we'll override in Optuna
+    eta = trial$suggest_float("eta", 0.01, 0.3),
+    gamma = trial$suggest_float("gamma", 0.0, 1.0),
+    max_depth = trial$suggest_int("max_depth", 3L, 15L),
+    subsample = trial$suggest_float("subsample", 0.5, 1.0),
+    colsample_bytree = trial$suggest_float("colsample_bytree", 0.5, 1.0),
+    min_child_weight = trial$suggest_float("min_child_weight", 0.5, 1.0),
+    lambda = trial$suggest_float("lambda", 0.0, 1.0),
+    alpha = trial$suggest_float("alpha", 0.0, 1.0)
+  )
+
+  # Train model
   model <- xgb$train(
     params = params,
     dtrain = dtrain,
@@ -118,9 +129,28 @@ objective <- function(trial) {
     early_stopping_rounds = 10L,
     verbose_eval = 0L
   )
-  
-  score <- model$best_score
-  return(score)
+
+  # Predict class probabilities
+  pred_probs <- model$predict(dvalid)
+  pred_labels <- ifelse(pred_probs > 0.5, 1, 0)
+
+  # Convert to R for metric computation
+  y_true <- py_to_r(y_valid)
+  y_pred <- py_to_r(pred_labels)
+
+  # Compute Balanced Accuracy
+  TP <- sum(y_true == 1 & y_pred == 1)
+  TN <- sum(y_true == 0 & y_pred == 0)
+  FP <- sum(y_true == 0 & y_pred == 1)
+  FN <- sum(y_true == 1 & y_pred == 0)
+
+  sensitivity <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))
+  specificity <- ifelse((TN + FP) == 0, 0, TN / (TN + FP))
+
+  balanced_acc <- 0.5 * (sensitivity + specificity)
+
+  # Return 1 - Balanced Accuracy to minimize
+  return(1 - balanced_acc)
 }
 
 study <- optuna$create_study(direction = "minimize")  # logloss minimization
