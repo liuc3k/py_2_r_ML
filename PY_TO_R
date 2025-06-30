@@ -1,315 +1,83 @@
 library(reticulate)
-library(rsample)
+library(xgboost)
+library(survcomp)
 
-# install_miniconda()
-
-conda_create("r-nanimputer-env", packages = "python=3.10")
-# conda_list()
-# reticulate::conda_install("r-nanimputer-env", 
-#                           packages = c("verstack", "pandas", "scikit-learn","lazypredict","optuna","lime"),
-#                           pip = TRUE
-# )
-# use_condaenv("r-nanimputer-env", required = TRUE)
-# py_config()
-# virtualenv_create()
-# py_install(c("lazypredict"), method = "pip")
-# py_install("lime",method="pip")
-# py_install(c("verstack", "pandas", "scikit-learn","lazypredict","optuna","lime"), method = "pip")
-# py_require("optuna")
-# py_require("lime")
-# py_run_string("import pkg_resources; print([(d.project_name, d.version) for d in pkg_resources.working_set])")
-py_require(c("verstack", "pandas", "scikit-learn","lazypredict","optuna","lime","numpy"))
-##Import required packages:
-lazy <- import("lazypredict.Supervised")
-verstack <- import("verstack")
-NaNImputer <- verstack$NaNImputer
-pd <- import("pandas")
-np <- import("numpy")
-xgb <- import("xgboost")
-# sklearn <- import("sklearn.model_selection")
-sklearn_model_selection <- import("sklearn.model_selection")
+# Activate Python + Optuna
 optuna <- import("optuna")
-# Create sample data
+np <- import("numpy")
 
-df<-read.csv('C:/Users/aas41/OneDrive/桌面/nanimputer_toy_data.csv')
-df[df=='']<-NA
-# Step 2: Convert R dataframe to pandas dataframe
-df_py <- r_to_py(df)
-# Step 3: Run NaNImputer
-imputer <- NaNImputer()
-df_imputed_py <- imputer$impute(df_py)
+# ---- Prepare Your Data (assume already subset to responders) ----
+# X_train_ivo, time_train_ivo, event_train_ivo assumed available
+# All categorical variables should already be one-hot encoded
 
-# Step 4: Convert back to R
-df_imputed <- py_to_r(df_imputed_py)
+# Ensure reproducibility
+set.seed(2025)
+np$random$seed(2025L)
 
-
-##Lazy Predict
-# Your existing R dataset
-# Example: df (data.frame), with outcome variable `y`(0/1)
-
-
-
-set.seed(123)
-split<-initial_split(df_imputed,prop = 0.8,strata = outcome)
-train_data<-training(split)
-test_data<-testing(split)
-X_train<-train_data[,-ncol(train_data)]
-y_train<-train_data$outcome
-
-X_test<-test_data[,-ncol(test_data)]
-y_test<-test_data$outcome
-
-# Convert to Python
-X_train_py <- r_to_py(as.data.frame(X_train))
-y_train_py <- r_to_py(as.integer(as.factor(y_train)))  # ensure numeric labels
-X_test_py <- r_to_py(as.data.frame(X_test))
-y_test_py <- r_to_py(as.integer(as.factor(y_test)))  # ensure numeric labels
-
-
-# Run LazyClassifier
-clf <- lazy$LazyClassifier(verbose = FALSE, ignore_warnings = TRUE)
-results <- clf$fit(X_train, X_test, y_train, y_test)
-
-# Convert results to R. Should consider Balanced Accuracy((Recall+Specificity)/2)
-model_results <- py_to_r(results[[1]])
-print(model_results)
-
-##Tune the hyperparameter via Optuna
-
-
-#step 1 
-# Assuming df is your R dataset with outcome 
-df_imputed_ <- df_imputed %>%
-  mutate(across(where(is.character), as.factor)) %>%
-  mutate(across(where(is.factor), ~ as.integer(.)))
-X <- df_imputed_[, setdiff(names(df_imputed_), "outcome")]
-y <- df_imputed_$outcome
-
-# Convert to Python
-X_py <- r_to_py(as.matrix(X))
-y_py <- r_to_py(as.integer(y))  # classification
-
-
+# ---- Define Optuna Objective Function ----
 objective <- function(trial) {
-  # Train-test split
-  split <- sklearn_model_selection$train_test_split(X_py, y_py, test_size = 0.2, random_state = 2025L)
-  X_train <- split[[1]]
-  X_valid <- split[[2]]
-  y_train <- split[[3]]
-  y_valid <- split[[4]]
-
-  # Compute sample weights
-  train_weight <- compute_class_weights(y_train)
-  valid_weight <- compute_class_weights(y_valid)
-
-  # Create DMatrix
-  dtrain <- xgb$DMatrix(X_train, label = y_train, weight = train_weight)
-  dvalid <- xgb$DMatrix(X_valid, label = y_valid, weight = valid_weight)
-
   # Suggest hyperparameters
-  params <- dict(
-    objective = "binary:logistic",
-    eval_metric = "logloss",  # required by XGBoost, but we'll override in Optuna
-    eta = trial$suggest_float("eta", 0.01, 0.3),
-    gamma = trial$suggest_float("gamma", 0.0, 1.0),
-    max_depth = trial$suggest_int("max_depth", 3L, 15L),
+  params <- list(
+    tree_method = "hist",
+    booster = "gbtree",
+    objective = "survival:aft",
+    eval_metric = "aft-nloglik",
+    
+    aft_loss_distribution = trial$suggest_categorical("aft_loss_distribution", c("normal", "logistic", "extreme")),
+    aft_loss_distribution_scale = trial$suggest_float("aft_loss_distribution_scale", 0.5, 5.0),
+    
+    eta = trial$suggest_float("eta", 0.01, 0.3, log = TRUE),
+    max_depth = trial$suggest_int("max_depth", 3, 8),
+    min_child_weight = trial$suggest_int("min_child_weight", 1, 10),
+    gamma = trial$suggest_float("gamma", 0, 5),
     subsample = trial$suggest_float("subsample", 0.5, 1.0),
     colsample_bytree = trial$suggest_float("colsample_bytree", 0.5, 1.0),
-    min_child_weight = trial$suggest_float("min_child_weight", 0.5, 1.0),
-    lambda = trial$suggest_float("lambda", 0.0, 1.0),
-    alpha = trial$suggest_float("alpha", 0.0, 1.0)
+    lambda = trial$suggest_float("lambda", 0, 10),
+    alpha = trial$suggest_float("alpha", 0, 10)
   )
-
-  # Train model
-  model <- xgb$train(
+  
+  # Train/validation split (e.g., 80/20) within responder subset
+  n <- nrow(X_train_ivo)
+  idx <- sample(1:n, size = 0.8 * n)
+  
+  X_tr <- as.matrix(X_train_ivo[idx, ])
+  X_val <- as.matrix(X_train_ivo[-idx, ])
+  time_tr <- time_train_ivo[idx]
+  time_val <- time_train_ivo[-idx]
+  event_tr <- event_train_ivo[idx]
+  event_val <- event_train_ivo[-idx]
+  
+  dtrain <- xgb.DMatrix(data = X_tr)
+  dvalid <- xgb.DMatrix(data = X_val)
+  
+  # Set survival bounds
+  dtrain$setinfo("label_lower_bound", time_tr)
+  dtrain$setinfo("label_upper_bound", ifelse(event_tr == 1, time_tr, Inf))
+  dvalid$setinfo("label_lower_bound", time_val)
+  dvalid$setinfo("label_upper_bound", ifelse(event_val == 1, time_val, Inf))
+  
+  # Train model with early stopping
+  model <- xgb.train(
     params = params,
-    dtrain = dtrain,
-    num_boost_round = 200L,
-    evals = list(list(dvalid, "eval")),
-    early_stopping_rounds = 10L,
-    verbose_eval = 0L
+    data = dtrain,
+    nrounds = 500,
+    watchlist = list(valid = dvalid),
+    early_stopping_rounds = 20,
+    verbose = 0
   )
-
-  # Predict class probabilities
-  pred_probs <- model$predict(dvalid)
-  pred_labels <- ifelse(pred_probs > 0.5, 1, 0)
-
-  # Convert to R for metric computation
-  y_true <- py_to_r(y_valid)
-  y_pred <- py_to_r(pred_labels)
-
-  # Compute Balanced Accuracy
-  TP <- sum(y_true == 1 & y_pred == 1)
-  TN <- sum(y_true == 0 & y_pred == 0)
-  FP <- sum(y_true == 0 & y_pred == 1)
-  FN <- sum(y_true == 1 & y_pred == 0)
-
-  sensitivity <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))
-  specificity <- ifelse((TN + FP) == 0, 0, TN / (TN + FP))
-
-  balanced_acc <- 0.5 * (sensitivity + specificity)
-
-  # Return 1 - Balanced Accuracy to minimize
-  return(1 - balanced_acc)
+  
+  # Predict and calculate C-index on validation set
+  pred_val <- predict(model, dvalid)
+  cindex <- concordance.index(x = pred_val, surv.time = time_val, surv.event = event_val)$c.index
+  
+  # Return negative C-index since Optuna minimizes
+  return(-cindex)
 }
 
-study <- optuna$create_study(direction = "minimize")  # logloss minimization
+# ---- Run Optuna Study ----
+study <- optuna$create_study(direction = "minimize")
 study$optimize(objective, n_trials = 50L)
 
-# Get best parameters
+# ---- Best Parameters ----
 best_params <- study$best_params
 print(best_params)
-
-
-##SS
-
-##MS
-
-##VT
-
-###SP-LIME (pART I)
-
-##SS
-
-##MS
-
-library(lime)
-library(dplyr)
-library(caret)
-library(xgboost)
-data(iris)
-iris <- iris[iris$Species != "setosa", ]
-iris$Species <- factor(iris$Species)
-xgb_grid <- data.frame(
-  nrounds = 100,
-  max_depth = 3,
-  eta = 0.1,
-  gamma = 0,
-  colsample_bytree = 1,
-  min_child_weight = 1,
-  subsample = 1
-)
-
-seeds <- 1:5
-folds <- 10
-results <- list()
-model_index <- 1
-
-for (seed in seeds) {
-  set.seed(seed)
-  
-  fold_indices <- createFolds(iris$Species, k = folds, returnTrain = TRUE)
-  
-  for (fold in seq_along(fold_indices)) {
-    train_data <- iris[fold_indices[[fold]], ]
-    test_data  <- iris[-fold_indices[[fold]], ]
-    
-    # Train XGBoost model on this fold
-    model <- 
-      train(
-        Species ~ .,
-        data = train_data,
-        method = "xgbTree",
-        trControl = trainControl(method = "none"),
-        tuneGrid = xgb_grid
-      )
-    
-    
-    # Store model and data
-    results[[model_index]] <- list(
-      model = model,
-      train = train_data,
-      test = test_data,
-      seed = seed,
-      fold = fold
-    )
-    
-    model_index <- model_index + 1
-  }
-}
-
-
-length(results)  # Should be 50
-
-
-lime_results <- list()
-
-for (i in seq_along(results)) {
-  res <- results[[i]]
-  model <- res$model
-  train_data <- res$train
-  test_data <- res$test
-  
-  
-  
-  # Create LIME explainer
-  explainer <- 
-    lime(train_data[, -which(names(train_data) == "Species")], 
-         model)
-  
-  
-  
-  
-  # Sample representative test points
-  reps <- test_data[sample(nrow(test_data), min(5, nrow(test_data))), 
-                    -which(names(test_data) == "Species")]
-  
-  # Explain for positive class (e.g., "versicolor")
-  explanation <-
-    lime::explain(reps, explainer, n_features = 10, labels = "versicolor")
-  
-  
-  if (!is.null(explanation) && nrow(explanation) > 0) {
-    explanation$fold <- res$fold
-    explanation$seed <- res$seed
-    lime_results[[length(lime_results) + 1]] <- explanation
-  }
-}
-
-
-all_explanations <- bind_rows(
-  Filter(function(x) !is.null(x) && is.data.frame(x) && nrow(x) > 0, lime_results)
-)
-
-# Summarize by feature
-feature_summary <- all_explanations %>%
-  group_by(feature) %>%
-  summarise(mean_weight = mean(feature_weight), .groups = "drop") %>%
-  mutate(
-    abs_weight = abs(mean_weight),
-    contribution_pct = abs_weight / sum(abs_weight)
-  ) %>%
-  filter(contribution_pct >= 0.03)
-
-# Filter explanation to those features only
-filtered_explanations <- all_explanations %>%
-  filter(feature %in% feature_summary$feature)
-
-# Final aggregation by feature_desc (for plot)
-global_sp_lime <- filtered_explanations %>%
-  group_by(feature_desc) %>%
-  summarise(mean_weight = mean(feature_weight), .groups = "drop") %>%
-  mutate(
-    abs_weight = abs(mean_weight),
-    direction = ifelse(mean_weight >= 0, "positive", "negative")
-  ) %>%
-  arrange(desc(abs_weight))
-
-library(ggplot2)
-
-ggplot(global_sp_lime, aes(x = reorder(feature_desc, mean_weight), y = mean_weight, fill = direction)) +
-  geom_col() +
-  coord_flip() +
-  scale_fill_manual(values = c("positive" = "orange", "negative" = "blue")) +
-  labs(
-    title = "SP-LIME Global Explanation (Class = 'versicolor')",
-    x = "Feature (Binned)",
-    y = "Mean LIME Contribution"
-  ) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
-  theme_minimal()
-
-
-##VT
-
-##LIME (Part II)
