@@ -1,83 +1,47 @@
-library(reticulate)
+library(caret)
 library(xgboost)
-library(survcomp)
+library(dplyr)
 
-# Activate Python + Optuna
-optuna <- import("optuna")
-np <- import("numpy")
+# 1. Split X and y
+X <- model.matrix(~ . -1, data = df[, -which(names(df) == "y")])  # predictors (no intercept)
+y <- df$y  # binary outcome (0/1)
 
-# ---- Prepare Your Data (assume already subset to responders) ----
-# X_train_ivo, time_train_ivo, event_train_ivo assumed available
-# All categorical variables should already be one-hot encoded
-
-# Ensure reproducibility
+# 2. Create 10-fold CV repeated 5 times
 set.seed(2025)
-np$random$seed(2025L)
+folds <- createMultiFolds(y = y, k = 10, times = 5)
 
-# ---- Define Optuna Objective Function ----
-objective <- function(trial) {
-  # Suggest hyperparameters
-  params <- list(
-    tree_method = "hist",
-    booster = "gbtree",
-    objective = "survival:aft",
-    eval_metric = "aft-nloglik",
-    
-    aft_loss_distribution = trial$suggest_categorical("aft_loss_distribution", c("normal", "logistic", "extreme")),
-    aft_loss_distribution_scale = trial$suggest_float("aft_loss_distribution_scale", 0.5, 5.0),
-    
-    eta = trial$suggest_float("eta", 0.01, 0.3, log = TRUE),
-    max_depth = trial$suggest_int("max_depth", 3, 8),
-    min_child_weight = trial$suggest_int("min_child_weight", 1, 10),
-    gamma = trial$suggest_float("gamma", 0, 5),
-    subsample = trial$suggest_float("subsample", 0.5, 1.0),
-    colsample_bytree = trial$suggest_float("colsample_bytree", 0.5, 1.0),
-    lambda = trial$suggest_float("lambda", 0, 10),
-    alpha = trial$suggest_float("alpha", 0, 10)
-  )
-  
-  # Train/validation split (e.g., 80/20) within responder subset
-  n <- nrow(X_train_ivo)
-  idx <- sample(1:n, size = 0.8 * n)
-  
-  X_tr <- as.matrix(X_train_ivo[idx, ])
-  X_val <- as.matrix(X_train_ivo[-idx, ])
-  time_tr <- time_train_ivo[idx]
-  time_val <- time_train_ivo[-idx]
-  event_tr <- event_train_ivo[idx]
-  event_val <- event_train_ivo[-idx]
-  
-  dtrain <- xgb.DMatrix(data = X_tr)
-  dvalid <- xgb.DMatrix(data = X_val)
-  
-  # Set survival bounds
-  dtrain$setinfo("label_lower_bound", time_tr)
-  dtrain$setinfo("label_upper_bound", ifelse(event_tr == 1, time_tr, Inf))
-  dvalid$setinfo("label_lower_bound", time_val)
-  dvalid$setinfo("label_upper_bound", ifelse(event_val == 1, time_val, Inf))
-  
-  # Train model with early stopping
-  model <- xgb.train(
-    params = params,
+# 3. Initialize accuracy tracker
+accuracies <- c()
+
+# 4. Loop through each fold
+for (i in seq_along(folds)) {
+  train_idx <- folds[[i]]
+  test_idx <- setdiff(seq_len(nrow(X)), train_idx)
+
+  dtrain <- xgb.DMatrix(data = X[train_idx, ], label = y[train_idx])
+  dtest  <- xgb.DMatrix(data = X[test_idx, ], label = y[test_idx])
+
+  # Train the XGBoost model
+  model <- xgboost(
     data = dtrain,
-    nrounds = 500,
-    watchlist = list(valid = dvalid),
-    early_stopping_rounds = 20,
+    objective = "binary:logistic",
+    nrounds = 50,  # You can tune this later
     verbose = 0
   )
-  
-  # Predict and calculate C-index on validation set
-  pred_val <- predict(model, dvalid)
-  cindex <- concordance.index(x = pred_val, surv.time = time_val, surv.event = event_val)$c.index
-  
-  # Return negative C-index since Optuna minimizes
-  return(-cindex)
+
+  # Predict on test data
+  pred_probs <- predict(model, dtest)
+  pred_labels <- ifelse(pred_probs >= 0.5, 1, 0)
+
+  # Compute accuracy
+  acc <- mean(pred_labels == y[test_idx])
+  accuracies <- c(accuracies, acc)
 }
 
-# ---- Run Optuna Study ----
-study <- optuna$create_study(direction = "minimize")
-study$optimize(objective, n_trials = 50L)
+# 5. Summary of results
+mean_acc <- mean(accuracies)
+sd_acc <- sd(accuracies)
 
-# ---- Best Parameters ----
-best_params <- study$best_params
-print(best_params)
+cat("Repeated 10-fold CV Results (5x):\n")
+cat("Mean Accuracy:", round(mean_acc, 4), "\n")
+cat("SD Accuracy:", round(sd_acc, 4), "\n")
