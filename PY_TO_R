@@ -1,21 +1,75 @@
 library(reticulate)
-np <- import("numpy")
+conda_create("r-nanimputer-env", packages = "python=3.10")
+# Load libraries
+library(xgboost)
+library(reticulate)
+library(ggplot2)
+library(dplyr)
+
+# Import Python packages
+pd <- import("pandas")
 lime <- import("lime.lime_tabular")
-sp <- import("lime.submodular_pick")
+sp  <- import("lime.submodular_pick")
 
-# For LIME input: make sure we keep numeric format
-X_train_np <- np$array(as.matrix(X_train))
-X_test_np  <- np$array(as.matrix(X_test))
+set.seed(123)
 
-# Python predict function wrapper
+n <- 200
+p <- 10
+
+# Simulated binary mutation features
+X <- as.data.frame(matrix(rbinom(n * p, 1, 0.3), nrow = n))
+colnames(X) <- paste0("Gene", 1:p)
+
+# Add a continuous variable
+X$LDH <- rnorm(n, 250, 50)
+
+# Outcome depends on some features
+y <- ifelse(X$Gene1 == 1 & X$LDH < 250, 1, 0)
+
+# Train/test split
+train_idx <- sample(1:n, 160)
+X_train <- X[train_idx, ]
+X_test  <- X[-train_idx, ]
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+
+dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+params <- list(objective = "binary:logistic", eval_metric = "logloss")
+
+model_xgb <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 50,
+  verbose = 0
+)
+
+
+# Step 1: Clean training data
+X_train_clean <- as.data.frame(X_train)
+colnames(X_train_clean) <- make.names(colnames(X_train_clean))  # ensure valid names
+
+# Step 2: Convert to Python
+X_train_py <- r_to_py(X_train_clean, convert = TRUE)
+
+# Do the same for test
+X_test_clean <- as.data.frame(X_test)
+colnames(X_test_clean) <- make.names(colnames(X_test_clean))
+X_test_py <- r_to_py(X_test_clean, convert = TRUE)
+
+np <- import("numpy")
+
+# Convert R data.frame to matrix first, then NumPy array
+X_train_np <- np$array(as.matrix(X_train_clean))
+X_test_np <- np$array(as.matrix(X_test_clean))
+
 py_predict <- function(x) {
-  x_mat <- as.matrix(x)
-  prob <- predict(model_xgb, newdata = x_mat, type = "prob")
-  cbind(prob[, "0"], prob[, "1"])  # Class order: 0 then 1
+  dtest <- xgb.DMatrix(data = as.matrix(x))
+  prob <- predict(model_xgb, dtest)
+  cbind(1 - prob, prob)
 }
 explainer <- lime$LimeTabularExplainer(
   training_data = X_train_np,
-  feature_names = colnames(X_train),
+  feature_names = colnames(X_train_clean),
   class_names = c("0", "1"),
   discretize_continuous = TRUE,
   mode = "classification",
@@ -31,44 +85,53 @@ sp_obj <- sp$SubmodularPick(
   num_exps_desired = 10L
 )
 exp_df <- do.call(rbind, lapply(seq_along(sp_obj$explanations), function(i) {
-  labels_available <- py_to_r(sp_obj$explanations[[i]]$available_labels())
-  label_used <- labels_available[[1]]
+  labels_available <- py_to_r(sp_obj$explanations[[i]]$available_labels())  # returns list like [0, 1]
+  label_used <- labels_available[[1]]  # keep it numeric
   
-  tryCatch({
-    expl <- py_to_r(sp_obj$explanations[[i]]$as_list(label = label_used))
-    data.frame(
-      feature = sapply(expl, function(x) x[[1]]),
-      weight = sapply(expl, function(x) x[[2]]),
-      case = i,
-      label = label_used,
-      stringsAsFactors = FALSE
-    )
-  }, error = function(e) {
-    NULL
-  })
+  expl <- py_to_r(sp_obj$explanations[[i]]$as_list(label = label_used))
+  
+  data.frame(
+    feature = sapply(expl, function(x) x[[1]]),
+    weight = sapply(expl, function(x) x[[2]]),
+    case = i,
+    label = label_used,
+    stringsAsFactors = FALSE
+  )
 }))
+
+
+
+
 library(ggplot2)
+library(dplyr)
 
-exp_df$label <- as.factor(exp_df$label)
-
-top_features <- exp_df %>%
+# Summarize: mean weight per feature per class
+plot_df <- exp_df %>%
   group_by(feature, label) %>%
-  summarise(mean_weight = mean(weight), .groups = "drop") %>%
+  summarise(mean_weight = mean(weight), .groups = "drop")
+
+# Order features by total contribution (absolute mean)
+top_features <- plot_df %>%
   group_by(feature) %>%
-  summarise(total_abs = sum(abs(mean_weight))) %>%
+  summarise(total_abs = sum(abs(mean_weight)), .groups = "drop") %>%
   slice_max(order_by = total_abs, n = 15) %>%
   pull(feature)
 
-plot_df <- exp_df %>% filter(feature %in% top_features)
 
-ggplot(plot_df, aes(x = reorder(feature, weight), y = weight, fill = label)) +
+# Filter only top features
+plot_df <- plot_df %>% filter(feature %in% top_features)
+
+# Plot
+plot_df$label <- as.factor(plot_df$label)
+
+ggplot(plot_df, aes(x = reorder(feature, mean_weight), y = mean_weight, fill = label)) +
   geom_col(position = position_dodge()) +
   coord_flip() +
   labs(
-    title = "SP-LIME Global Explanations (caret-trained XGBoost)",
-    x = "Feature",
-    y = "Mean LIME Weight",
-    fill = "Predicted Class"
+    title = "Mean Coefficients of LIME explanations by class",
+    x = NULL,
+    y = "Mean Coefficients from LIME explanations"
   ) +
-  scale_fill_manual(values = c("#00BFFF", "#BA55D3")) +
+  scale_fill_manual(values = c("#00BFFF", "#BA55D3"), labels = c("0", "1")) +
   theme_minimal(base_size = 14)
+
