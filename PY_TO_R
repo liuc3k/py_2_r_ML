@@ -1,41 +1,5 @@
-library(dplyr)
-##1. Aggregate Global Feature Importance from exp_df
-# Compute total absolute importance
-feature_importance_df <- exp_df %>%
-  group_by(feature) %>%
-  summarise(
-    importance = sum(weight),  # keep direction
-    abs_importance = sum(abs(weight)),
-    .groups = "drop"
-  )
+Machine-Learning–Driven Prediction of Response and Survival Outcomes in IDH1-Mutated AML: A Dual-Project Study Integrating Clinical and Genomic Features
 
-# Total sum of absolute values
-total_abs_importance <- sum(abs(feature_importance_df$importance))
+Acute myeloid leukaemia (AML) harbours a diverse genomic landscape in which isocitrate dehydrogenase-1 (IDH1) mutations represent an actionable subset. Ivosidenib, an oral mutant-IDH1 inhibitor, is approved for relapsed/refractory AML, yet reliable tools for predicting who will respond—and for how long—remain limited. We therefore implemented a two-part machine-learning (ML) programme, following the FDA’s reference pipeline, to evaluate predictive performance and interpretability in 213 IDH1-mutated AML subjects. Project 1 modelled binary response to ivosidenib across three input scenarios—clinical variables only, genomic variables only, and their combination. Conventional logistic regression plateaued at ≈ 0.64 accuracy, whereas Extreme Gradient Boosting (XGB) reached 0.77 on the combined dataset. Local Interpretable Model-agnostic Explanations (LIME) revealed baseline platelet count, number of prior regimens, and bone-marrow blast percentage as the dominant drivers of response probability.
 
-# Relative importance
-feature_importance_df <- feature_importance_df %>%
-  mutate(relative_importance = abs_importance / total_abs_importance)
-
-threshold <- 0.03
-filtered_df <- feature_importance_df %>%
-  filter(relative_importance >= threshold) %>%
-  arrange(desc(abs_importance))
-
-
-library(ggplot2)
-
-ggplot(filtered_df, aes(x = reorder(feature, importance), y = importance, fill = importance > 0)) +
-  geom_col(width = 0.7) +
-  scale_fill_manual(values = c("TRUE" = "orange", "FALSE" = "blue"), labels = c("Negative", "Positive")) +
-  coord_flip() +
-  geom_text(aes(label = sprintf("%.3f", importance)), hjust = ifelse(filtered_df$importance > 0, -0.2, 1.1),
-            color = "black", size = 3.5) +
-  labs(
-    title = "Feature Importance and Contribution Direction from SP-LIME",
-    x = "Feature",
-    y = "SP-LIME Explanation Value",
-    fill = "Contribution"
-  ) +
-  geom_vline(xintercept = 0, linetype = "dashed") +
-  theme_minimal()
-
+Project 2 extended the framework to survival end-points. Using the same feature sets, we compared the Cox proportional-hazards model with Random Survival Forest, Gradient-Boosted Survival Trees, and the XGB-Cox algorithm. Classical Cox achieved a concordance index (C-index) of 0.62, whereas XGB-Cox improved performance to 0.70. SHapley Additive exPlanations (SHAP) indicated that low bone-marrow blast percentage and high baseline platelets were the most favourable prognostic factors for durable response. Collectively, these projects show that explainable ML models can outperform traditional methods while producing clinician-interpretable insights—an essential step toward broader adoption of AI-driven decision support in oncology.
