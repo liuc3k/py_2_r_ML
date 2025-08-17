@@ -1,252 +1,53 @@
-# app.R  — XGBoost Cox • verstack.NaNImputer • SS/MS/VT • SHAP (no tuning)
 library(shiny)
-library(readr)
-library(dplyr)
-library(rsample)
-library(fastDummies)
-library(xgboost)
-library(survival)
-library(ggplot2)
-library(purrr)
-library(reticulate)
-
-# If needed, set Python explicitly *before* imports:
-# Sys.setenv(RETICULATE_PYTHON = "C:/Users/ME/miniconda3/python.exe")
-
-# ---- Python imports (once) ----
-pd         <- import("pandas", convert = FALSE)
-np         <- import("numpy", convert = FALSE)
-verstack   <- import("verstack", convert = FALSE)
-NaNImputer <- verstack$NaNImputer
-xgb_py     <- import("xgboost", convert = FALSE)
-shap       <- import("shap", convert = FALSE)
-mpl        <- import("matplotlib", convert = FALSE)
-plt        <- import("matplotlib.pyplot", convert = FALSE)
-mpl$use("Agg")  # headless backend for plots
-
-# ---- Fixed (your) XGBoost Cox params — edit these to your tuned values ----
-FIXED_PARAMS <- list(
-  objective = "survival:cox",
-  eval_metric = "cox-nloglik",
-  tree_method = "hist",
-  eta = 0.05,
-  max_depth = 3,
-  subsample = 0.8,
-  colsample_bytree = 0.8,
-  min_child_weight = 1
-)
-NROUNDS <- 200
-ESR     <- 30
-VAR_Q   <- 0.25  # VT: drop bottom 25% variance numeric features
+library(DiagrammeR)
 
 ui <- fluidPage(
-  titlePanel("Machine Learning Survival Project"),
-  sidebarLayout(
-    sidebarPanel(
-      fileInput("file", "Upload CSV (wide; missing allowed)", accept = ".csv"),
-      uiOutput("choose_time"),
-      uiOutput("choose_event"),
-      checkboxInput("event_is_censored", "Event column is 1 = CENSORED (like CNSR)", TRUE),
-      checkboxInput("remove_first_dummy", "Reference coding (remove first dummy)", TRUE),
-      actionButton("go", "Impute + Evaluate + Explain")
-    ),
-    mainPanel(
-      tabsetPanel(
-        tabPanel("1) Data preview",
-                 h4("Raw data (head)"),
-                 tableOutput("raw_head"),
-                 h4("After NaNImputer (head)"),
-                 tableOutput("imp_head")),
-        tabPanel("2) Model evaluation (SS / MS / VT)",
-                 fluidRow(
-                   column(4, verbatimTextOutput("ss_txt")),
-                   column(4, verbatimTextOutput("ms_txt")),
-                   column(4, verbatimTextOutput("vt_txt"))
-                 ),
-                 plotOutput("cbar", height = 320)),
-        tabPanel("3) SHAP (whole imputed data)",
-                 h4("Global SHAP summary"),
-                 imageOutput("shap_img", height = "auto"))
-      )
+  titlePanel("ML Pipeline"),
+  tabsetPanel(
+    tabPanel("Workflow",
+             br(),
+             grVizOutput("workflow", height = "520px")
     )
+    # ... your other tabs ...
   )
 )
 
 server <- function(input, output, session){
   
-  # ---------- Load uploaded CSV ----------
-  raw_df <- reactive({
-    req(input$file)
-    readr::read_csv(input$file$datapath, show_col_types = FALSE)
+  output$workflow <- renderGrViz({
+    grViz("
+      digraph mlflow {
+        graph [rankdir = TB, nodesep=0.4, ranksep=0.55]
+        node  [shape=diamond, style=filled, fontname=Helvetica, color=grey40]
+
+        // main steps
+        raw   [label='Raw Data',                  fillcolor='#c6dbef']
+        prep  [label='Pre-process\\n(Imputation)',fillcolor='#fdd0a2']
+        tune  [label='Hyperparameter Tuning\\n(10-fold CV, Optuna)', fillcolor='#fee6ce']
+        eval  [label='Model Evaluation',          fillcolor='#c6dbef']
+        expl  [label='Explain Model\\n(SHAP)',    fillcolor='#a1d99b']
+
+        // sub-steps under evaluation
+        node  [shape=box, style=filled]
+        ss    [label='SS', fillcolor='white']
+        ms    [label='MS', fillcolor='white']
+        vt    [label='VT', fillcolor='white']
+
+        // layout
+        raw -> prep -> tune -> eval
+        eval -> { ss ms vt }
+        { ss ms vt } -> expl
+
+        // optional grouping look
+        subgraph cluster_eval {
+          label='Evaluation Setups'
+          color=grey80
+          style=dashed
+          ss ms vt
+        }
+      }
+    ")
   })
-  output$raw_head <- renderTable({ head(req(raw_df()), 8) })
-  
-  output$choose_time <- renderUI({
-    req(raw_df()); selectInput("time_col","Time column", names(raw_df()), selected = "AVAL")
-  })
-  output$choose_event <- renderUI({
-    req(raw_df()); selectInput("event_col","Event/Censor column", names(raw_df()), selected = "CNSR")
-  })
-  
-  # ---------- Impute exactly like your script ----------
-  imputed <- reactive({
-    df <- req(raw_df())
-    validate(
-      need(input$time_col %in% names(df), "Select a valid time column"),
-      need(input$event_col %in% names(df), "Select a valid event/censor column")
-    )
-    
-    predictors <- df %>% dplyr::select(-all_of(c(input$time_col, input$event_col)))
-    outcome    <- df %>% dplyr::select(all_of(c(input$time_col, input$event_col)))
-    
-    # empty strings -> NA
-    predictors[predictors == ""] <- NA
-    
-    # integers -> numeric (match your lapply)
-    predictors[] <- lapply(predictors, function(col) {
-      if (is.integer(col)) as.numeric(col) else col
-    })
-    
-    # R -> pandas, run NaNImputer via $impute() (fallback to fit_transform for older versions)
-    X_py <- r_to_py(predictors, convert = TRUE)
-    imp  <- NaNImputer()
-    X_imp_py <- if (!is.null(imp$impute)) imp$impute(X_py) else imp$fit_transform(X_py)
-    
-    # pandas -> R; characters -> factors; re-bind outcomes
-    X_imp <- py_to_r(X_imp_py) %>%
-      dplyr::mutate(dplyr::across(where(is.character), as.factor))
-    os_imputed <- dplyr::bind_cols(X_imp, outcome)
-    
-    # (If present in your data)
-    if ("BLECOG" %in% names(os_imputed)) os_imputed$BLECOG <- as.factor(os_imputed$BLECOG)
-    
-    os_imputed
-  })
-  output$imp_head <- renderTable({ head(req(imputed()), 8) })
-  
-  # ---------- Helpers ----------
-  prep_xy <- function(dat, time_col, event_col, event_is_censored, remove_first_dummy=TRUE, drop_cols=NULL){
-    time  <- dat[[time_col]]
-    ev    <- dat[[event_col]]
-    event <- if (isTRUE(event_is_censored)) 1 - as.numeric(ev) else as.numeric(ev)
-    
-    X <- dat %>% select(-all_of(c(time_col, event_col)))
-    if (!is.null(drop_cols)) X <- X %>% select(-any_of(drop_cols))
-    X_dummy <- fastDummies::dummy_cols(
-      X, remove_first_dummy = remove_first_dummy,
-      remove_selected_columns = TRUE, ignore_na = TRUE
-    )
-    list(X = as.matrix(X_dummy),
-         time = as.numeric(time),
-         event = as.numeric(event),
-         feat_names = colnames(X_dummy))
-  }
-  
-  eval_ss <- function(dat){
-    set.seed(34)
-    sp <- initial_split(dat, prop = 0.8, strata = !!sym(input$event_col))
-    tr <- training(sp); te <- testing(sp)
-    trxy <- prep_xy(tr, input$time_col, input$event_col, input$event_is_censored,
-                    isTRUE(input$remove_first_dummy))
-    texy <- prep_xy(te, input$time_col, input$event_col, input$event_is_censored,
-                    isTRUE(input$remove_first_dummy))
-    
-    dtr <- xgb.DMatrix(data = trxy$X, label = cbind(trxy$time, trxy$event))
-    dte <- xgb.DMatrix(data = texy$X, label = cbind(texy$time, texy$event))
-    bst <- xgb.train(params = FIXED_PARAMS, data = dtr,
-                     nrounds = NROUNDS, early_stopping_rounds = ESR,
-                     watchlist = list(train=dtr, eval=dte), verbose = 0)
-    pred <- predict(bst, dte)
-    concordance(Surv(texy$time, texy$event) ~ pred)$concordance
-  }
-  
-  eval_ms <- function(dat){
-    set.seed(43)
-    v <- vfold_cv(dat, v = 10, repeats = 5, strata = !!sym(input$event_col))
-    mean(map_dbl(v$splits, function(s){
-      tr <- analysis(s); te <- assessment(s)
-      trxy <- prep_xy(tr, input$time_col, input$event_col, input$event_is_censored,
-                      isTRUE(input$remove_first_dummy))
-      texy <- prep_xy(te, input$time_col, input$event_col, input$event_is_censored,
-                      isTRUE(input$remove_first_dummy))
-      dtr <- xgb.DMatrix(data = trxy$X, label = cbind(trxy$time, trxy$event))
-      dte <- xgb.DMatrix(data = texy$X, label = cbind(texy$time, texy$event))
-      bst <- xgb.train(params = FIXED_PARAMS, data = dtr,
-                       nrounds = NROUNDS, early_stopping_rounds = ESR,
-                       watchlist = list(train=dtr, eval=dte), verbose = 0)
-      pred <- predict(bst, dte)
-      concordance(Surv(texy$time, texy$event) ~ pred)$concordance
-    }))
-  }
-  
-  eval_vt <- function(dat){
-    work <- dat %>% select(-all_of(c(input$time_col, input$event_col)))
-    num  <- names(work)[sapply(work, is.numeric)]
-    vv   <- sapply(work[num], function(z) var(z, na.rm=TRUE))
-    thr  <- as.numeric(quantile(vv, VAR_Q, na.rm = TRUE))
-    low  <- names(vv)[vv < thr]
-    eval_ms(dat %>% select(-any_of(low)))
-  }
-  
-  # ---------- Main pipeline ----------
-  res <- eventReactive(input$go, {
-    dat_imp <- imputed()
-    
-    c_ss <- eval_ss(dat_imp)
-    c_ms <- eval_ms(dat_imp)
-    c_vt <- eval_vt(dat_imp)
-    
-    # Retrain on full imputed data for SHAP
-    full <- prep_xy(dat_imp, input$time_col, input$event_col, input$event_is_censored,
-                    isTRUE(input$remove_first_dummy))
-    dtr  <- xgb.DMatrix(data = full$X, label = cbind(full$time, full$event))
-    bstR <- xgb.train(params = FIXED_PARAMS, data = dtr,
-                      nrounds = NROUNDS, early_stopping_rounds = ESR,
-                      watchlist = list(train = dtr), verbose = 0)
-    
-    # Save R model → load as Python Booster for SHAP
-    model_path <- file.path(tempdir(), "xgb_cox.model")
-    xgb.save(bstR, model_path)
-    
-    booster_py <- xgb_py$Booster()
-    booster_py$load_model(model_path)
-    
-    # pandas DataFrame with column names
-    X_df_py <- pd$DataFrame(full$X)
-    X_df_py$columns <- r_to_py(full$feat_names)
-    
-    explainer <- shap$TreeExplainer(booster_py)
-    shap_vals <- explainer$shap_values(X_df_py)
-    
-    shap_png <- file.path(tempdir(), "shap_summary.png")
-    plt$figure()
-    shap$summary_plot(shap_vals, X_df_py, show = FALSE, max_display = as.integer(20))
-    plt$tight_layout()
-    plt$savefig(shap_png, dpi = as.integer(180))
-    plt$close()
-    
-    list(c_ss=c_ss, c_ms=c_ms, c_vt=c_vt, shap_png=shap_png)
-  })
-  
-  # ---------- Outputs ----------
-  output$ss_txt <- renderText({ req(res()); sprintf("SS C-index: %.3f", res()$c_ss) })
-  output$ms_txt <- renderText({ req(res()); sprintf("MS C-index (10×5): %.3f", res()$c_ms) })
-  output$vt_txt <- renderText({ req(res()); sprintf("VT C-index: %.3f", res()$c_vt) })
-  
-  output$cbar <- renderPlot({
-    req(res())
-    df <- data.frame(Approach=c("SS","MS","VT"),
-                     Cindex=c(res()$c_ss, res()$c_ms, res()$c_vt))
-    ggplot(df, aes(Approach, Cindex, fill=Approach)) +
-      geom_col() + coord_cartesian(ylim=c(0,1)) +
-      theme_minimal() + theme(legend.position="none")
-  })
-  
-  output$shap_img <- renderImage({
-    req(res()$shap_png)
-    list(src = res()$shap_png, contentType = "image/png",
-         width = "100%", alt = "SHAP summary")
-  }, deleteFile = FALSE)
 }
 
 shinyApp(ui, server)
